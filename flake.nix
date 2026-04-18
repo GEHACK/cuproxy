@@ -19,7 +19,7 @@
       in
       {
         packages.default = pkgs.buildGoModule {
-          pname = "cuproxy";
+          name = "cuproxy";
           src = ./.;
 
           vendorHash = "sha256-tuSDQ1FAMn91GAkuoAQcPC1rX5sPl8MgijY5TrCV+ek=";

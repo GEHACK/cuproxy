@@ -9,7 +9,6 @@ self:
 let
   cfg = config.services.cuproxy;
 
-  # The package, defaulting to the one from this flake.
   defaultPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
   logLevels = [
@@ -75,7 +74,6 @@ in
       default = { };
       example = lib.literalExpression ''
         {
-          # Banner page layout
           BANNER_APPEND       = "false";
           PDF_PAGE_SIZE       = "A4";
           PDF_LANDSCAPE       = "false";
@@ -83,15 +81,12 @@ in
           PDF_LEFT_MARGIN     = "10";
           PDF_TOP_MARGIN      = "10";
 
-          # Webhooks (parallel with &&, sequential with |)
           WEBHOOKS_TO_CALL    = "auth;POST;https://auth.example.com/banner&&info;GET;https://info.example.com";
           WEBHOOK_MAX_DURATION = "30s";
 
-          # cupsfilter / PPD for non-PDF input conversion
           CUPSFILTER_LOCATION = "''${pkgs.cups}/sbin/cupsfilter";
           PPD_LOCATION        = "''${pkgs.cups}/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd";
 
-          # Debug helpers
           DUMP_IPP_CONTENTS   = "/var/log/cuproxy/ipp";
         }
       '';
@@ -147,8 +142,6 @@ in
         AmbientCapabilities = [ "CAP_NET_BIND_SERVICE" ];
         CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
 
-        EnvironmentFile = lib.mkIf (cfg.environmentFile != null) cfg.environmentFile;
-
         NoNewPrivileges = true;
         PrivateTmp = true;
         ProtectSystem = "strict";
@@ -164,6 +157,9 @@ in
 
         Restart = "on-failure";
         RestartSec = "5s";
+      }
+      // lib.optionalAttrs (cfg.environmentFile != null) {
+        EnvironmentFile = cfg.environmentFile;
       };
     };
   };
