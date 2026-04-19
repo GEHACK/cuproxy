@@ -2,3 +2,4 @@ dumps
 *.pdf
 cuproxy-*
 result
+.direnv
