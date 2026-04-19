@@ -59,41 +59,32 @@ in
       description = "Log verbosity level.";
     };
 
-    useGhostscript = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Use Ghostscript instead of pdfcpu for PDF stitching.
-        Requires Ghostscript to be available (add it to `extraEnv.PATH` or
-        set `extraEnv.GS` if it is not on the default PATH).
-      '';
-    };
-
-    extraEnv = lib.mkOption {
+    settings = lib.mkOption {
       type = lib.types.attrsOf lib.types.str;
       default = { };
       example = lib.literalExpression ''
         {
-          BANNER_APPEND       = "false";
-          PDF_PAGE_SIZE       = "A4";
-          PDF_LANDSCAPE       = "false";
-          PDF_FONT_SIZE       = "12";
-          PDF_LEFT_MARGIN     = "10";
-          PDF_TOP_MARGIN      = "10";
+          USE_GHOSTSCRIPT      = "true";
+          BANNER_APPEND        = "false";
+          PDF_PAGE_SIZE        = "A4";
+          PDF_LANDSCAPE        = "false";
+          PDF_FONT_SIZE        = "12";
+          PDF_LEFT_MARGIN      = "10";
+          PDF_TOP_MARGIN       = "10";
 
-          WEBHOOKS_TO_CALL    = "auth;POST;https://auth.example.com/banner&&info;GET;https://info.example.com";
+          WEBHOOKS_TO_CALL     = "auth;POST;https://auth.example.com/banner&&info;GET;https://info.example.com";
           WEBHOOK_MAX_DURATION = "30s";
 
-          CUPSFILTER_LOCATION = "''${pkgs.cups}/sbin/cupsfilter";
-          PPD_LOCATION        = "''${pkgs.cups}/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd";
+          CUPSFILTER_LOCATION  = "''${pkgs.cups}/sbin/cupsfilter";
+          PPD_LOCATION         = "''${pkgs.cups}/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd";
 
-          DUMP_IPP_CONTENTS   = "/var/log/cuproxy/ipp";
+          DUMP_IPP_CONTENTS    = "/var/log/cuproxy/ipp";
         }
       '';
       description = ''
-        Extra environment variables passed verbatim to the service. Use these
-        for all options not covered by the structured options above. See the
-        project README for the full list of supported variables.
+        Additional environment variables passed to the service. Keys are
+        environment variable names, values are their values. See the project
+        README for the full list of supported variables.
       '';
     };
 
@@ -125,16 +116,12 @@ in
         LISTEN = cfg.listen;
         PRINTER_TO = cfg.printerTo;
         LOG_LEVEL = cfg.logLevel;
-        USE_GHOSTSCRIPT = if cfg.useGhostscript then "true" else "false";
         CUPSFILTER_LOCATION = "${pkgs.cups}/sbin/cupsfilter";
         PPD_LOCATION = "${pkgs.cups-filters}/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd";
         HOME = "/var/lib/cuproxy";
         XDG_CONFIG_HOME = "/var/lib/cuproxy/.config";
       }
-      // lib.optionalAttrs cfg.useGhostscript {
-        PATH = "${pkgs.ghostscript}/bin";
-      }
-      // cfg.extraEnv;
+      // cfg.settings;
 
       serviceConfig = {
         ExecStart = lib.getExe cfg.package;
