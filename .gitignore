@@ -3,3 +3,4 @@ dumps
 cuproxy-*
 result
 .direnv
+.env
