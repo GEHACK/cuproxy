@@ -128,6 +128,8 @@ in
         USE_GHOSTSCRIPT = if cfg.useGhostscript then "true" else "false";
         CUPSFILTER_LOCATION = "${pkgs.cups}/sbin/cupsfilter";
         PPD_LOCATION = "${pkgs.cups-filters}/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd";
+        HOME = "/var/lib/cuproxy";
+        XDG_CONFIG_HOME = "/var/lib/cuproxy/.config";
       }
       // lib.optionalAttrs cfg.useGhostscript {
         PATH = "${pkgs.ghostscript}/bin";
