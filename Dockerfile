@@ -16,7 +16,7 @@ COPY --from=build /cuproxy /cuproxy
 EXPOSE 631
 
 # Include cups and cups-filters to convert to pdf.
-RUN apk add --no-cache cups cups-filters
+RUN apk add --no-cache cups cups-filters typst
 
 ENV PPD_LOCATION=/usr/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd
 ENV CUPSFILTER_LOCATION=/usr/sbin/cupsfilter
