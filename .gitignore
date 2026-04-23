@@ -8,3 +8,5 @@ result
 cuproxy
 *.jpg
 *.py
+*.typ
+*png

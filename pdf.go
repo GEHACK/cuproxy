@@ -10,7 +10,6 @@ import (
 
 	"github.com/jung-kurt/gofpdf"
 	"github.com/rs/zerolog"
-
 	"github.com/tuupke/utils/env"
 )
 
@@ -45,6 +44,9 @@ func pointsToUnits(points float64) float64 {
 }
 
 func BannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys ...string) error {
+	if typstTemplate != "" {
+		return TypstBannerPage(log, outWrite, data, keys...)
+	}
 	if len(keys) == 1 && keys[0] == "*" {
 		keys = make([]string, 0, 100)
 		data.Range(func(key, _ string) bool {
@@ -60,7 +62,10 @@ func BannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys ...str
 		orientation = "L"
 	}
 
-	log.Info().Bool("landscape", pdfInLandscape).Int("num_keys", len(keys)).Msg("rendering new banner")
+	log.Info().
+		Bool("landscape", pdfInLandscape).
+		Int("num_keys", len(keys)).
+		Msg("rendering new banner")
 
 	pdf := gofpdf.New(orientation, pdfUnit, pdfSize, pdfFontDir)
 	if bannerOnBack {

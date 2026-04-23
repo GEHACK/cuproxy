@@ -37,6 +37,7 @@
             go
             gopls
             gotools
+            typst
           ];
         };
       }

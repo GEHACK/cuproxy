@@ -1,16 +1,13 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"slices"
 
 	"github.com/jung-kurt/gofpdf"
 	"github.com/rs/zerolog"
-
 	"github.com/tuupke/utils/env"
 )
 
@@ -33,47 +30,7 @@ func init() {
 	}
 }
 
-type typstData struct {
-	Keys []string          `json:"keys"`
-	Data map[string]string `json:"data"`
-}
-
-func TypstBannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys ...string) error {
-	if len(keys) == 1 && keys[0] == "*" {
-		keys = make([]string, 0, 100)
-		data.Range(func(key, _ string) bool {
-			keys = append(keys, key)
-			return true
-		})
-
-		slices.Sort(keys)
-	}
-
-	// Build the data structure for the template
-	td := typstData{
-		Keys: keys,
-		Data: make(map[string]string, len(keys)),
-	}
-	for _, k := range keys {
-		if v, ok := data.Load(k); ok {
-			td.Data[k] = v
-		}
-	}
-
-	// Write JSON data to a temp file
-	jsonFile, err := os.CreateTemp("", "cuproxy-typst-data-*.json")
-	if err != nil {
-		return fmt.Errorf("could not create temp json file: %w", err)
-	}
-	defer os.Remove(jsonFile.Name())
-
-	if err := json.NewEncoder(jsonFile).Encode(td); err != nil {
-		jsonFile.Close()
-		return fmt.Errorf("could not write json data: %w", err)
-	}
-	jsonFile.Close()
-
-	// Create temp output PDF
+func TypstBannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, _ ...string) error {
 	outFile, err := os.CreateTemp("", "cuproxy-typst-out-*.pdf")
 	if err != nil {
 		return fmt.Errorf("could not create temp output file: %w", err)
@@ -81,12 +38,13 @@ func TypstBannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys .
 	defer os.Remove(outFile.Name())
 	outFile.Close()
 
-	// Compile the typst template. --root / is needed so the template can
-	// resolve the absolute path to the JSON data file.
-	cmd := exec.Command(typstBin, "compile", typstTemplate, outFile.Name(),
-		"--root", "/",
-		"--input", "data-path="+jsonFile.Name(),
-	)
+	args := []string{"compile", typstTemplate, outFile.Name(), "--root", "/"}
+	data.Range(func(k, v string) bool {
+		args = append(args, "--input", k+"="+v)
+		return true
+	})
+
+	cmd := exec.Command(typstBin, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Error().Err(err).Str("output", string(output)).Msg("typst compilation failed")
@@ -100,7 +58,6 @@ func TypstBannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys .
 	defer compiled.Close()
 
 	if bannerOnBack {
-		// Prepend a blank page by stitching a blank PDF before the compiled output
 		blank, err := blankPage()
 		if err != nil {
 			return fmt.Errorf("could not create blank page: %w", err)
@@ -115,7 +72,6 @@ func TypstBannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys .
 	return err
 }
 
-// blankPage creates a single blank PDF page and returns an open file seeked to the start.
 func blankPage() (*os.File, error) {
 	f, err := os.CreateTemp("", "cuproxy-typst-blank-*.pdf")
 	if err != nil {
