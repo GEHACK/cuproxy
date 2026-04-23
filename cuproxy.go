@@ -14,15 +14,16 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/chebyrash/promise"
 	"github.com/fasthttp/router"
+	"github.com/joho/godotenv"
 	pdfcpu "github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/puzpuzpuz/xsync"
 	"github.com/rs/zerolog"
 	zlog "github.com/rs/zerolog/log"
-	"github.com/valyala/fasthttp"
-
 	"github.com/tuupke/utils/env"
 	"github.com/tuupke/utils/lifecycle"
+	"github.com/valyala/fasthttp"
 )
 
 var (
@@ -41,15 +42,19 @@ var (
 	maxRequestSize   = 128 << 20 // env.Int("MAX_REQUEST_SIZE", 128<<20) // 128 MiB
 	seqId            = new(uint64)
 	numPrints        = new(uint64)
-	ppdLocation      = env.String("PPD_LOCATION", "/usr/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd")
+	ppdLocation      = env.String(
+		"PPD_LOCATION",
+		"/usr/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd",
+	)
 
 	panicWithoutBanner = env.Bool("BANNER_MUST_EXIST", false)
 
 	pdfLocation = strings.TrimRight(env.String("PDF_LOCATION", os.TempDir()), "/")
 
-	// requestPromises maps all cups job-id's to structs that aid with interacting
-	// with the data-retrieval promises.
-	requestPromises = xsync.NewIntegerMapOf[int32, promiseInteraction]()
+	// requestPromises maps every CUPS job-id to the promise that will resolve
+	// to the banner PDF for that job. Populated on the CreateJob (0x05) request
+	// and awaited on the subsequent PrintJob (0x02 / 0x06) request.
+	requestPromises = xsync.NewIntegerMapOf[int32, *promise.Promise[*os.File]]()
 )
 
 func init() {
@@ -61,15 +66,19 @@ func init() {
 
 	zlog.Info().Msg("using loglevel " + l.String())
 	zerolog.SetGlobalLevel(l)
+	err = godotenv.Load()
+	if err != nil {
+		zlog.Info().Msg("error" + err.Error())
+	}
 }
 
 func main() {
-	if err := os.MkdirAll(pdfLocation, 0755); err != nil {
+	if err := os.MkdirAll(pdfLocation, 0o755); err != nil {
 		zlog.Fatal().Err(err).Str("pdf-folder", pdfLocation).Msg("cannot create pdf-folder")
 	}
 
 	routes := router.New()
-	routes.PanicHandler = func(ctx *fasthttp.RequestCtx, i interface{}) {
+	routes.PanicHandler = func(ctx *fasthttp.RequestCtx, i any) {
 		zlog.Error().Interface("error", i).Msg("received panic")
 		debug.PrintStack()
 	}
@@ -85,7 +94,7 @@ func main() {
 		}
 		zlog.Info().Str("path", dumpsPath).Msg("deleted previous dumps folder")
 
-		if err := os.MkdirAll(dumpsPath, 0755); err != nil {
+		if err := os.MkdirAll(dumpsPath, 0o755); err != nil {
 			zlog.Fatal().Str("path", dumpsPath).Err(err).Msg("could not create dumps folder")
 		}
 		zlog.Info().Msg("created dumps folder")
@@ -106,7 +115,11 @@ func main() {
 	zlog.Info().Msg("started cups proxy")
 	go server.Serve(ln)
 
-	zlog.Info().Str("printer to", printerTo).Str("listen", cupsListen).Int("max_body_size", maxRequestSize).Msg("Booted")
+	zlog.Info().
+		Str("printer to", printerTo).
+		Str("listen", cupsListen).
+		Int("max_body_size", maxRequestSize).
+		Msg("Booted")
 	lifecycle.Cleanup(func() { zlog.Warn().Msg("Stopping") })
 	lifecycle.AwaitStop()
 }
@@ -129,7 +142,7 @@ func writeToFile[T Byter](seqId uint64, request, replaced bool, contents T) erro
 		return nil
 	}
 
-	var req, typ = "res", "orig"
+	req, typ := "res", "orig"
 	if request {
 		req = "req"
 	}
@@ -139,7 +152,7 @@ func writeToFile[T Byter](seqId uint64, request, replaced bool, contents T) erro
 	}
 
 	name := fmt.Sprintf("%v/%v-%v-%v.bin", dumpsPath, seqId, req, typ)
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0755)
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR, 0o755)
 	if err != nil {
 		return fmt.Errorf("could not open dump-file '%v'; %w", name, err)
 	}
@@ -255,13 +268,19 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 	// Construct a logger
 	path := bytes.Trim(ctx.Request.URI().Path(), "/")
 	requestedUrl := fmt.Sprintf("ipp://%s/%s", cupsListen, path)
-	log := zlog.With().IPAddr("ip", ctx.RemoteIP()).Str("url", requestedUrl).Uint64("seq-id", seqId).Logger()
+	log := zlog.With().
+		IPAddr("ip", ctx.RemoteIP()).
+		Str("url", requestedUrl).
+		Uint64("seq-id", seqId).
+		Logger()
 
 	// Replace the url in the body, the actual printer's url is constant so does not
 	// need to be rebuilt every request.
 	from := btsReplace([]byte(requestedUrl))
-	log.Debug().Err(writeToFile[byteSlice](seqId, true, false, body)).Msg("written original request")
-	body = bytes.Replace(body, from, to, -1)
+	log.Debug().
+		Err(writeToFile[byteSlice](seqId, true, false, body)).
+		Msg("written original request")
+	body = bytes.ReplaceAll(body, from, to)
 
 	var b *bytes.Buffer
 	if !isPrint {
@@ -270,8 +289,8 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 	} else {
 		// An actual print job.
 
-		// Retrieve the data
-		var v promiseInteraction
+		// Retrieve (or start) the banner-PDF promise for this job.
+		var bannerPromise *promise.Promise[*os.File]
 		var found bool
 		jobId, found = extractInt("job-id", body)
 		log := log.With().Int32("job-id", jobId).Bool("job-id-found", found).Logger()
@@ -279,12 +298,12 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 
 		if !found {
 			log.Error().Msg("got print and cannot extract job-id, unusual")
-			v = loadValues(log, ctx, jobId)
+			bannerPromise = loadValues(log, ctx, jobId)
 		} else {
-			v, found = requestPromises.Load(jobId)
+			bannerPromise, found = requestPromises.Load(jobId)
 			if !found {
 				log.Warn().Msg("did not find promise for job, i.e. job is unknown to proxy; trying to load new data")
-				v = loadValues(log, ctx, jobId)
+				bannerPromise = loadValues(log, ctx, jobId)
 			}
 		}
 
@@ -320,7 +339,7 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 		}
 
 		// Extract the
-		var contents = make([]byte, len(body)-startOfData)
+		contents := make([]byte, len(body)-startOfData)
 		copy(contents, body[startOfData:])
 
 		var prefix, suffix []byte
@@ -359,14 +378,21 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 		// It must now hold that `contents` contains a PDF.
 		pdfReader := bytes.NewReader(contents)
 
-		// The to-be-printed document is ready, retrieve, or wait for the rendering of,
-		// the banner-pdf.
-		v.callItIn()
-		filePointer, err := v.pdfPromise.Await(lifecycle.Context())
+		// The to-be-printed document is ready; wait for the banner PDF. This
+		// blocks until every webhook has finished — we do not render with
+		// partial data.
+		filePointer, err := bannerPromise.Await(lifecycle.Context())
 		log.Err(err).Msg("retrieved PDF to stitch")
 
-		// If no banner page exists, skip stitching, and (by default) pass the original print to the printer.
-		if filePointer != nil {
+		// If no banner page exists (or its promise failed), fall back to
+		// proxying the original print unmodified.
+		if filePointer == nil {
+			if panicWithoutBanner {
+				log.Panic().Msg("no banner, aborting")
+			}
+			log.Warn().Msg("no banner available, forwarding original print unchanged")
+			b = bytes.NewBuffer(body)
+		} else {
 			file := *filePointer
 			defer file.Close()
 
@@ -382,7 +408,6 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 			}
 
 			err := stitch(pdf, mw, useGhostscript)
-
 			log.Err(err).Msg("merged banner with main print")
 			if err == nil {
 				num, err := io.Copy(newB, tempReader)
@@ -395,10 +420,7 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 			// what will be sent to the actual printer.
 			num, err = newB.Write(suffix)
 			log.Trace().Err(err).Int("num", num).Msg("written rest of request to new body")
-			// Replace the body
 			b = newB
-		} else if panicWithoutBanner {
-			log.Panic().Msg("no banner, aborting")
 		}
 	}
 
@@ -408,7 +430,10 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 	proxiedRequest, err := http.NewRequest(string(ctx.Method()), "http://"+printerTo, b)
 	log.Debug().Err(err).Msg("created request to proxy")
 	ctx.Request.Header.VisitAll(func(key, value []byte) {
-		proxiedRequest.Header.Add(string(key), strings.Replace(string(value), requestedUrl[5:], printerTo, -1))
+		proxiedRequest.Header.Add(
+			string(key),
+			strings.ReplaceAll(string(value), requestedUrl[5:], printerTo),
+		)
 	})
 
 	resp, err := http.DefaultClient.Do(proxiedRequest)
@@ -428,15 +453,19 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 	ctx.SetStatusCode(resp.StatusCode)
 	for k, values := range resp.Header {
 		for _, value := range values {
-			repl := strings.Replace(value, printerTo, requestedUrl[5:], -1)
+			repl := strings.ReplaceAll(value, printerTo, requestedUrl[5:])
 			ctx.Response.Header.Add(k, repl)
 		}
 	}
 
-	log.Trace().Err(writeToFile[byteSlice](seqId, false, false, body)).Msg("written original response")
-	body = bytes.Replace(body, to, from, -1)
+	log.Trace().
+		Err(writeToFile[byteSlice](seqId, false, false, body)).
+		Msg("written original response")
+	body = bytes.ReplaceAll(body, to, from)
 	log.Debug().Msg("replaced response body")
-	log.Trace().Err(writeToFile[byteSlice](seqId, false, true, body)).Msg("written replaced response")
+	log.Trace().
+		Err(writeToFile[byteSlice](seqId, false, true, body)).
+		Msg("written replaced response")
 
 	if isCreate {
 		var found bool
@@ -445,13 +474,7 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 			// Weirdness happens here
 			log.Warn().Msg("cannot deduce job-id though it should be present!")
 		} else {
-			var pp promiseInteraction
-			if isCreate {
-				pp = loadValues(log, ctx, jobId)
-			}
-
-			// Store as job
-			requestPromises.Store(jobId, pp)
+			requestPromises.Store(jobId, loadValues(log, ctx, jobId))
 		}
 	}
 
@@ -487,7 +510,7 @@ func setReplace(body []byte) []byte {
 	// The two nulls represent the 'empty key' and thus the value should be interpreted as being part of last key.
 
 	// All keys storing mime-types should be set to 'application/pdf'. The type depicting a mime-type is "I"
-	var result = make([]byte, len(body))
+	result := make([]byte, len(body))
 	// We know all our properties start with 0x49 0x00
 	prefix := []byte("I\u0000")
 
