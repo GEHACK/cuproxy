@@ -57,7 +57,8 @@ func TestParseToCallString(t *testing.T) {
 				method: http.MethodPost,
 				name:   "pixie",
 				url:    "https://localhost:9000/",
-			}},
+			},
+		},
 	}, res)
 }
 
@@ -78,7 +79,7 @@ func TestLoad(t *testing.T) {
 		endpoints{
 			endpoint{
 				method: http.MethodGet,
-				name:   imageKey,
+				name:   "image",
 				url:    "https://www.w3.org/MarkUp/Test/xhtml-print/20050519/tests/jpeg444.jpg",
 			},
 		},

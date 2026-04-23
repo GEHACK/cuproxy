@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -10,154 +9,44 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
-	"github.com/chebyrash/promise"
-	"github.com/panjf2000/ants/v2"
 	"github.com/puzpuzpuz/xsync"
 	"github.com/rs/zerolog"
+	"github.com/tuupke/utils/env"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasttemplate"
-
-	"github.com/tuupke/utils/env"
-	"github.com/tuupke/utils/lifecycle"
 )
 
-type (
-	Props struct {
-		ip net.IP
+// Props holds the per-request bag of key/value data we expose to webhook URLs,
+// webhook bodies, and the banner template. It is keyed by IP + basic-auth +
+// request URI (see Load) and survives across requests so repeat prints from
+// the same client reuse accumulated data.
+type Props struct {
+	ip net.IP
 
-		*xsync.MapOf[string, string]
+	*xsync.MapOf[string, string]
 
-		latestData time.Time
-	}
-
-	// promiseInteraction is a promise used to interact with external data and the
-	// banner pdf.
-	promiseInteraction struct {
-		callItIn   func()
-		pdfPromise *promise.Promise[*os.File]
-	}
-)
-
-var (
-	cpuPool, ioPool  promise.Pool
-	printKeys        = strings.Split(env.String("PRINT_KEYS", "*"), ",")
-	includeBasicAuth = env.Bool("BASIC_AUTH_IN_DATA", false)
-	basicAuthUser    = env.String("BASIC_AUTH_USERNAME", "ba_username")
-	basicAuthPass    = env.String("BASIC_AUTH_PASSWORD", "ba_password")
-	alwaysFreshData  = env.Bool("BANNER_DATA_ALWAYS_FRESH", false)
-)
-
-func init() {
-	cpuPoolA, err := ants.NewPool(runtime.NumCPU())
-	if err != nil {
-		panic(err)
-	}
-
-	ioPoolA, err := ants.NewPool(runtime.NumCPU() * 5)
-	if err != nil {
-		panic(err)
-	}
-
-	ioPool = promise.FromAntsPool(ioPoolA)
-	cpuPool = promise.FromAntsPool(cpuPoolA)
+	// latestData is the time of the most recent successful webhook response.
+	// Used by the banner cache to decide whether to re-render.
+	latestData time.Time
 }
 
+// e is a zero-sized token used where Go's type system wants a value but we
+// only care about the signal. `empty` is the canonical instance.
 type e struct{}
 
 var empty = e{}
 
-func loadValues(log zerolog.Logger, ctx *fasthttp.RequestCtx, jobId int32) promiseInteraction {
-	// Load or create a Props instance
-	data := LoadFromRequest(ctx)
-	isInitial := data.latestData.IsZero() || alwaysFreshData
-
-	log = log.With().IPAddr("for", data.ip).Int32("job-id", jobId).Logger()
-
-	awaitCtx, cancel := context.WithCancel(lifecycle.Context())
-	waitFor := len(toCall)
-	c := make(chan e, waitFor)
-	log.Info().Int("num_hooks", waitFor).Msg("loading data")
-	for _, set := range toCall {
-		ioPool.Go(set.handle(c, log, data))
-	}
-
-	// fanin is a promise that awaits until all
-	fanin := promise.New(func(resolve func(e), reject func(error)) {
-		log.Info().Bool("will-wait", isInitial).Int("webhooks-to-finish", waitFor).Msg("awaiting finish")
-
-		var ctxEnd bool
-		for !ctxEnd && waitFor > 0 {
-			if isInitial {
-				<-c
-				waitFor--
-				log.Debug().Int("remaining", waitFor).Msg("waiting for more hooks")
-			} else {
-				select {
-				case <-c:
-					waitFor--
-				case <-awaitCtx.Done():
-					log.Warn().Msg("called in")
-					ctxEnd = true
-				}
-			}
-		}
-
-		resolve(empty)
-	})
-
-	// computes result based on the fetched data, runs on cpuOptimizedPool
-	pdfPromise := promise.ThenWithPool(fanin, lifecycle.Context(), func(_ e) (*os.File, error) {
-		// Load the stat on the pdf
-		fn := pdfLocation + "/" + data.ip.String() + ".pdf"
-		file, err := os.OpenFile(fn, os.O_RDWR|os.O_CREATE, 0755)
-		if err != nil {
-			// Something went really wrong here, unrecoverable
-			return nil, fmt.Errorf("encountered error opening file '%v'; %w", fn, err)
-		}
-
-		if fi, err := file.Stat(); err == nil && fi.Size() > 0 && fi != nil && fi.ModTime().After(data.latestData) && !data.latestData.IsZero() {
-			log.Info().Msg("reusing cached banner")
-			return file, err
-		}
-
-		log.Err(file.Truncate(0)).Msg("creating new banner, truncated file")
-		// Render the pdf, data is either up-to or out-of-date, we don't care!
-		return file, BannerPage(log, file, data, printKeys...)
-	}, cpuPool)
-
-	return promiseInteraction{callItIn: cancel, pdfPromise: pdfPromise}
-}
-
-type mapWriter map[string]string
-
-func (m mapWriter) MarshalZerologObject(e *zerolog.Event) {
-	for k, v := range m {
-		e.Str(k, v)
-	}
-}
-
-func replaceParameters(template string, data *Props, webhookname string) (string, mapWriter) {
-	// params stores the retrieved parameters, this trick works since a slice is a pointer type.
-	d := make(mapWriter)
-	return fasttemplate.New(template, "{{", "}}").ExecuteFuncString(func(w io.Writer, tag string) (int, error) {
-		if tag == "webhook_name" {
-			d[tag] = webhookname
-			return w.Write([]byte(webhookname))
-		}
-
-		v, _ := data.Load(tag)
-		d[tag] = v
-		return w.Write([]byte(v))
-	}), d
-}
-
 var (
-	imageKey    = env.String("IMAGE_KEY", "image")
-	props       = xsync.NewMapOf[Props]()
+	props = xsync.NewMapOf[Props]()
+
+	includeBasicAuth = env.Bool("BASIC_AUTH_IN_DATA", false)
+	basicAuthUser    = env.String("BASIC_AUTH_USERNAME", "ba_username")
+	basicAuthPass    = env.String("BASIC_AUTH_PASSWORD", "ba_password")
+
+	imageKeys   = strings.Split(env.String("IMAGE_KEYS", ""), ",")
 	keyTemplate = env.String("WEBHOOK_KEY_TEMPLATE", "")
 	downloadTo  = env.String("WEBHOOK_TEMP_DIR", os.TempDir())
 
@@ -165,57 +54,17 @@ var (
 	toCall       endpointsSet
 )
 
-// Variables used for checking validity
-var (
-	methods = map[string]struct{}{
-		http.MethodGet:     empty,
-		http.MethodHead:    empty,
-		http.MethodPost:    empty,
-		http.MethodPut:     empty,
-		http.MethodPatch:   empty,
-		http.MethodDelete:  empty,
-		http.MethodConnect: empty,
-		http.MethodOptions: empty,
-		http.MethodTrace:   empty,
-	}
-)
-
-func parseToCallString(toCallString string) (e endpointsSet, gerr error) {
-	// Parse the toCallString
-
-	eps := strings.Split(toCallString, "&&")
-	e = make([]endpoints, len(eps))
-	for k, set := range eps {
-		ep := strings.Split(set, "|")
-		e[k] = make([]endpoint, len(ep))
-		for kk, end := range ep {
-			s := strings.SplitN(end, ";", 3)
-			if len(s) < 3 {
-				gerr = fmt.Errorf("invalid webhook spec found, expected 3 parts: '%v'", e)
-				return
-			}
-
-			// Attempt to parse the url
-			_, err := url.Parse(s[2])
-			if err != nil {
-				gerr = fmt.Errorf("could not parse url '%v'; %w", s[2], err)
-				return
-			}
-
-			if _, ok := methods[s[1]]; !ok {
-				gerr = fmt.Errorf("could not parse method '%v' for url '%v', expected values look like GET, POST, DELETE", s[1], s[2])
-				return
-			}
-
-			e[k][kk] = endpoint{
-				name:   s[0],
-				method: s[1],
-				url:    s[2],
-			}
-		}
-	}
-
-	return
+// methods is the set of HTTP verbs accepted in WEBHOOKS_TO_CALL.
+var methods = map[string]struct{}{
+	http.MethodGet:     empty,
+	http.MethodHead:    empty,
+	http.MethodPost:    empty,
+	http.MethodPut:     empty,
+	http.MethodPatch:   empty,
+	http.MethodDelete:  empty,
+	http.MethodConnect: empty,
+	http.MethodOptions: empty,
+	http.MethodTrace:   empty,
 }
 
 func init() {
@@ -232,18 +81,94 @@ func init() {
 		fmt.Println("Empty download dir, using", downloadTo)
 	}
 
-	if err := os.MkdirAll(downloadTo, 0755); err != nil {
+	if err := os.MkdirAll(downloadTo, 0o755); err != nil {
 		panic(fmt.Errorf("could not create download folder '%v'; %w", downloadTo, err))
 	}
 }
 
+// parseToCallString parses the WEBHOOKS_TO_CALL env var into an endpointsSet.
+// Format: "name;METHOD;url|name;METHOD;url && name;METHOD;url" — sets separated
+// by "&&", endpoints within a set separated by "|". Each set runs sequentially,
+// each set is dispatched concurrently with the others.
+func parseToCallString(toCallString string) (e endpointsSet, gerr error) {
+	eps := strings.Split(toCallString, "&&")
+	e = make([]endpoints, len(eps))
+	for k, set := range eps {
+		ep := strings.Split(set, "|")
+		e[k] = make([]endpoint, len(ep))
+		for kk, end := range ep {
+			s := strings.SplitN(end, ";", 3)
+			if len(s) < 3 {
+				gerr = fmt.Errorf("invalid webhook spec found, expected 3 parts: '%v'", e)
+				return
+			}
+
+			if _, err := url.Parse(s[2]); err != nil {
+				gerr = fmt.Errorf("could not parse url '%v'; %w", s[2], err)
+				return
+			}
+
+			if _, ok := methods[s[1]]; !ok {
+				gerr = fmt.Errorf(
+					"could not parse method '%v' for url '%v', expected values look like GET, POST, DELETE",
+					s[1],
+					s[2],
+				)
+				return
+			}
+
+			e[k][kk] = endpoint{
+				name:   s[0],
+				method: s[1],
+				url:    s[2],
+			}
+		}
+	}
+
+	return
+}
+
+// mapWriter is a map[string]string that knows how to serialize itself into a
+// zerolog event. Used for logging the template parameters that were actually
+// substituted into a webhook URL.
+type mapWriter map[string]string
+
+func (m mapWriter) MarshalZerologObject(e *zerolog.Event) {
+	for k, v := range m {
+		e.Str(k, v)
+	}
+}
+
+// replaceParameters expands `{{key}}` placeholders in `template` using values
+// from data. The `webhook_name` key is special-cased to the current webhook's
+// name. Returns the expanded string and a mapWriter of the values actually
+// consumed (for logging).
+func replaceParameters(template string, data *Props, webhookname string) (string, mapWriter) {
+	d := make(mapWriter)
+	return fasttemplate.New(template, "{{", "}}").
+			ExecuteFuncString(func(w io.Writer, tag string) (int, error) {
+				if tag == "webhook_name" {
+					d[tag] = webhookname
+					return w.Write([]byte(webhookname))
+				}
+
+				v, _ := data.Load(tag)
+				d[tag] = v
+				return w.Write([]byte(v))
+			}),
+		d
+}
+
+// decodeBasicAuth parses an HTTP `Authorization: Basic ...` header into its
+// user/pass components. ok=false if the header is missing, not basic auth, or
+// malformed.
 func decodeBasicAuth(auth []byte) (ok bool, user, pass string) {
-	i := bytes.IndexByte(auth, ' ')
-	if i == -1 || !bytes.EqualFold(auth[:i], []byte("basic")) {
+	before, after, hasSpace := bytes.Cut(auth, []byte{' '})
+	if !hasSpace || !bytes.EqualFold(before, []byte("basic")) {
 		return
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(string(auth[i+1:]))
+	decoded, err := base64.StdEncoding.DecodeString(string(after))
 	if err != nil {
 		return
 	}
@@ -254,19 +179,18 @@ func decodeBasicAuth(auth []byte) (ok bool, user, pass string) {
 	}
 
 	user, pass, ok = string(credentials[0]), string(credentials[1]), true
-
 	return
 }
 
+// LoadFromRequest extracts the lookup key (IP + basic-auth + URI) from an
+// incoming request, seeds the initial Props data from path segments of the
+// form `key=value`, and returns the (possibly pre-existing) Props for that key.
 func LoadFromRequest(ctx *fasthttp.RequestCtx) *Props {
-	// Construct the key from the ip, basic-auth username, and basic-auth password.
 	ok, user, pass := decodeBasicAuth(ctx.Request.Header.Peek("Authorization"))
 	ip := ctx.RemoteIP()
 
-	var baseData = make(map[string]string)
-	segments := strings.Split(strings.Trim(string(ctx.Request.URI().Path()), "/"), "/")
-	for _, segment := range segments {
-		// Split the segment, only add if the actually is something to add
+	baseData := make(map[string]string)
+	for segment := range strings.SplitSeq(strings.Trim(string(ctx.Request.URI().Path()), "/"), "/") {
 		keyValues := strings.SplitN(segment, "=", 2)
 		if len(keyValues) > 1 {
 			baseData[keyValues[0]] = keyValues[1]
@@ -282,14 +206,16 @@ func LoadFromRequest(ctx *fasthttp.RequestCtx) *Props {
 	return Load(ip, baseData, user, pass, ctx.Request.URI().String())
 }
 
+// Load returns the Props for a given (ip, segments...) key, creating one
+// seeded with baseData if it does not already exist.
 func Load(ip net.IP, baseData map[string]string, segments ...string) *Props {
 	key := ip.String() + "::" + strings.Join(segments, "::")
-	props, load := (*xsync.MapOf[string, *Props])(props).LoadOrStore(key, &Props{
+	props, loaded := (*xsync.MapOf[string, *Props])(props).LoadOrStore(key, &Props{
 		ip:    ip,
 		MapOf: xsync.NewMapOf[string](),
 	})
 
-	if !load {
+	if !loaded {
 		for k, v := range baseData {
 			props.Store(k, v)
 		}
@@ -298,6 +224,7 @@ func Load(ip net.IP, baseData map[string]string, segments ...string) *Props {
 	return props
 }
 
+// Reduce returns a copy of the Props restricted to the given keys.
 func (p *Props) Reduce(keys ...string) (mp map[string]string) {
 	mp = make(map[string]string)
 	for _, key := range keys {
@@ -309,6 +236,8 @@ func (p *Props) Reduce(keys ...string) (mp map[string]string) {
 	return
 }
 
+// json serializes the Props (plus the extra map) into a flat JSON object.
+// Used as the body for non-GET webhook calls.
 func (p *Props) json(extra map[string]string) io.Reader {
 	// TODO create a pool of buffers to use
 	b := new(bytes.Buffer)
@@ -320,12 +249,12 @@ func (p *Props) json(extra map[string]string) io.Reader {
 			b.WriteByte(',')
 		}
 		b.WriteByte('"')
-		b.WriteString(strings.Replace(key, `"`, `\"`, -1))
+		b.WriteString(strings.ReplaceAll(key, `"`, `\"`))
 		b.WriteByte('"')
 		b.WriteString(":")
 
 		b.WriteByte('"')
-		b.WriteString(strings.Replace(value, `"`, `\"`, -1))
+		b.WriteString(strings.ReplaceAll(value, `"`, `\"`))
 		b.WriteByte('"')
 
 		notFirst = true

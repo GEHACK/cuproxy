@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -28,7 +29,6 @@ var (
 	imgDpi = float64(env.Int("IMAGE_PPI", 120))
 )
 
-// pointsToUnits converts a fontsize in points to the unit stored in pdfUnit.
 func pointsToUnits(points float64) float64 {
 	switch pdfUnit {
 	case "mm", "":
@@ -64,7 +64,6 @@ func BannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys ...str
 
 	pdf := gofpdf.New(orientation, pdfUnit, pdfSize, pdfFontDir)
 	if bannerOnBack {
-		// Add an empty page if the banner is supposed to be printed on the back. Assumes a duplexer is installed.
 		pdf.AddPage()
 	}
 
@@ -78,38 +77,63 @@ func BannerPage(log zerolog.Logger, outWrite io.Writer, data *Props, keys ...str
 			continue
 		}
 
-		// Note, the length check here to make sure we can safely extract the extension.
-		// This does mean that the image name "/tmp/pixie/png" is invalid!
-		if strings.HasPrefix(k, "img") && len(val) >= 4 {
-			// The value of this contains either a path, or a url. Load the image and add it
-			image, err := os.Open(val)
-			if err != nil {
-				log.Err(err).Str("key", k).Str("value", val).Msg("cannot open image")
-				continue
+		if slices.Contains(imageKeys, k) && val != "" {
+			if err := renderImage(log, pdf, k, val, &yTop); err != nil {
+				log.Err(err).Str("key", k).Str("value", val).Msg("could not render image, skipping")
 			}
-
-			// They way the download works ensures the image is stored using the correct extension
-			// Take the last 4 characters from the filename and strip the '.' period if needed.
-			ext := val[len(val)-4:]
-			if ext[0] == '.' {
-				ext = ext[1:]
-			}
-
-			mime := "image/" + ext
-			defer image.Close()
-
-			// Attempt to load the image
-			iopts := gofpdf.ImageOptions{ReadDpi: true, ImageType: mime}
-			opts := pdf.RegisterImageOptionsReader(k, iopts, image)
-			opts.SetDpi(imgDpi)
-			pdf.ImageOptions(k, pdfLeftMargin, yTop, 0, 0, true, iopts, 0, "")
-
-			yTop += opts.Height()
-		} else {
-			pdf.Text(pdfLeftMargin, yTop+pdfLineHeight, fmt.Sprintf("%v: %v", k, val))
-			yTop += pdfLineHeight
+			continue
 		}
+
+		pdf.Text(pdfLeftMargin, yTop+pdfLineHeight, fmt.Sprintf("%v: %v", k, val))
+		yTop += pdfLineHeight
 	}
 
 	return pdf.Output(outWrite)
+}
+
+func renderImage(log zerolog.Logger, pdf *gofpdf.Fpdf, key, path string, yTop *float64) error {
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+	if ext == "jpeg" {
+		ext = "jpg"
+	}
+	if ext != "jpg" && ext != "png" && ext != "gif" {
+		return fmt.Errorf("unsupported image extension %q for %q", ext, path)
+	}
+
+	image, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open image %q: %w", path, err)
+	}
+	defer image.Close()
+
+	iopts := gofpdf.ImageOptions{ReadDpi: true, ImageType: ext}
+	info := pdf.RegisterImageOptionsReader(key, iopts, image)
+	if info == nil {
+		if pdfErr := pdf.Error(); pdfErr != nil {
+			return fmt.Errorf("gofpdf rejected image %q: %w", path, pdfErr)
+		}
+		return fmt.Errorf("gofpdf returned nil image info for %q", path)
+	}
+
+	info.SetDpi(imgDpi)
+
+	pageW, _ := pdf.GetPageSize()
+	maxW := pageW - 2*pdfLeftMargin
+	w, h := info.Width(), info.Height()
+	if w > maxW {
+		h = h * maxW / w
+		w = maxW
+	}
+
+	pdf.ImageOptions(key, pdfLeftMargin, *yTop, w, h, true, iopts, 0, "")
+	*yTop += h + pdfLineHeight
+
+	log.Debug().
+		Str("key", key).
+		Str("path", path).
+		Float64("drawn_w", w).
+		Float64("drawn_h", h).
+		Float64("y", *yTop).
+		Msg("rendered image")
+	return nil
 }

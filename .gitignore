@@ -4,3 +4,7 @@ cuproxy-*
 result
 .direnv
 .env
+*.jpeg
+cuproxy
+*.jpg
+*.py
