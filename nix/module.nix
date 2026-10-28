@@ -53,6 +53,36 @@ in
       '';
     };
 
+    printerTls = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Whether the real printer is an `ipps` queue. Jobs are then forwarded
+        over HTTPS. A corporate CA can be trusted through
+        `security.pki.certificateFiles`.
+      '';
+    };
+
+    printerTlsSkipVerify = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Skip verification of the printer's TLS certificate. Only use this for
+        printers with self-signed certificates on a trusted network.
+      '';
+    };
+
+    printerUsername = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "svc-contest-print";
+      description = ''
+        When set, the `requesting-user-name` of every proxied IPP request is
+        replaced by this value, so all jobs are owned by the same user on the
+        real printer.
+      '';
+    };
+
     logLevel = lib.mkOption {
       type = lib.types.enum logLevels;
       default = "info";
@@ -115,11 +145,16 @@ in
       environment = {
         LISTEN = cfg.listen;
         PRINTER_TO = cfg.printerTo;
+        PRINTER_TLS = lib.boolToString cfg.printerTls;
+        PRINTER_TLS_SKIP_VERIFY = lib.boolToString cfg.printerTlsSkipVerify;
         LOG_LEVEL = cfg.logLevel;
         CUPSFILTER_LOCATION = "${pkgs.cups}/sbin/cupsfilter";
         PPD_LOCATION = "${pkgs.cups-filters}/share/ppd/cupsfilters/Generic-PDF_Printer-PDF.ppd";
         HOME = "/var/lib/cuproxy";
         XDG_CONFIG_HOME = "/var/lib/cuproxy/.config";
+      }
+      // lib.optionalAttrs (cfg.printerUsername != null) {
+        PRINTER_USERNAME = cfg.printerUsername;
       }
       // cfg.settings;
 

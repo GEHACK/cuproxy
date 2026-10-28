@@ -25,6 +25,18 @@ func TestExtractInt(t *testing.T) {
 	fmt.Println(int32(binary.BigEndian.Uint32([]byte(body))))
 }
 
+func TestReplaceNameAttribute(t *testing.T) {
+	prefix := "\u0002\u0000\u0000\u0005\u0000\u0000\u0000\u0001\u0001"
+	suffix := "B\u0000\u0008job-name\u0000\u0003foo\u0003%PDF"
+	body := prefix + "B\u0000\u0014requesting-user-name\u0000\u0006team42" + suffix
+
+	replaced := replaceNameAttribute([]byte(body), "requesting-user-name", "corp.printer.user")
+	assert.Equal(t, prefix+"B\u0000\u0014requesting-user-name\u0000\u0011corp.printer.user"+suffix, string(replaced))
+
+	withoutUser := prefix + suffix
+	assert.Equal(t, withoutUser, string(replaceNameAttribute([]byte(withoutUser), "requesting-user-name", "corp")))
+}
+
 func TestLoadTwice(t *testing.T) {
 	ip := net.ParseIP("127.0.0.1")
 	if a, b := Load(ip, nil), Load(ip, nil); a != b {

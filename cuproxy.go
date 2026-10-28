@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -27,10 +28,15 @@ import (
 )
 
 var (
-	cupsListen = env.String("LISTEN", ":631")
-	printerTo  = env.String("PRINTER_TO", "")
+	cupsListen           = env.String("LISTEN", ":631")
+	printerTo            = env.String("PRINTER_TO", "")
+	printerTLS           = env.Bool("PRINTER_TLS", false)
+	printerTLSSkipVerify = env.Bool("PRINTER_TLS_SKIP_VERIFY", false)
+	printerUsername      = env.String("PRINTER_USERNAME", "")
 
-	to = btsReplace([]byte("ipp://" + printerTo))
+	ippScheme, httpScheme = printerSchemes(printerTLS)
+	to                    = btsReplace([]byte(ippScheme + "://" + printerTo))
+	printerClient         = newPrinterClient()
 
 	dumpsPath        = env.String("DUMP_IPP_CONTENTS", "")
 	dumpReplacements = env.Bool("DUMP_REPLACEMENTS", false)
@@ -117,6 +123,8 @@ func main() {
 
 	zlog.Info().
 		Str("printer to", printerTo).
+		Bool("printer tls", printerTLS).
+		Str("printer username", printerUsername).
 		Str("listen", cupsListen).
 		Int("max_body_size", maxRequestSize).
 		Msg("Booted")
@@ -281,6 +289,9 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 		Err(writeToFile[byteSlice](seqId, true, false, body)).
 		Msg("written original request")
 	body = bytes.ReplaceAll(body, from, to)
+	if printerUsername != "" {
+		body = replaceNameAttribute(body, "requesting-user-name", printerUsername)
+	}
 
 	var b *bytes.Buffer
 	if !isPrint {
@@ -427,7 +438,7 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 	log.Trace().Err(writeToFile(seqId, true, true, b)).Msg("written replaced request")
 
 	// Construct the proxy request, since `b` is always a *bytes.Buffer and these get closed automatically
-	proxiedRequest, err := http.NewRequest(string(ctx.Method()), "http://"+printerTo, b)
+	proxiedRequest, err := http.NewRequest(string(ctx.Method()), httpScheme+"://"+printerTo, b)
 	log.Debug().Err(err).Msg("created request to proxy")
 	ctx.Request.Header.VisitAll(func(key, value []byte) {
 		proxiedRequest.Header.Add(
@@ -436,7 +447,7 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 		)
 	})
 
-	resp, err := http.DefaultClient.Do(proxiedRequest)
+	resp, err := printerClient.Do(proxiedRequest)
 	log.Debug().Err(err).Msg("proxied request")
 	err = proxiedRequest.Body.Close()
 	log.Debug().Err(err).Msg("closed request body")
@@ -555,6 +566,43 @@ func setReplace(body []byte) []byte {
 
 	// Re-slice the byte slice to the correct length.
 	return result[:appendedUntil+len(body)-matchedUntil]
+}
+
+func printerSchemes(useTLS bool) (ipp, web string) {
+	if useTLS {
+		return "ipps", "https"
+	}
+
+	return "ipp", "http"
+}
+
+func newPrinterClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: printerTLSSkipVerify}
+
+	return &http.Client{Transport: transport}
+}
+
+func replaceNameAttribute(body []byte, name, value string) []byte {
+	key := make([]byte, 3, len(name)+3)
+	key[0] = 0x42
+	binary.BigEndian.PutUint16(key[1:], uint16(len(name)))
+	key = append(key, name...)
+
+	index := bytes.Index(body, key)
+	if index < 0 {
+		return body
+	}
+
+	valueStart := index + len(key)
+	valueEnd := valueStart + 2 + int(binary.BigEndian.Uint16(body[valueStart:]))
+
+	replaced := make([]byte, 0, len(body)-(valueEnd-valueStart)+2+len(value))
+	replaced = append(replaced, body[:valueStart]...)
+	replaced = binary.BigEndian.AppendUint16(replaced, uint16(len(value)))
+	replaced = append(replaced, value...)
+
+	return append(replaced, body[valueEnd:]...)
 }
 
 func extractInt(name string, body []byte) (value int32, found bool) {
