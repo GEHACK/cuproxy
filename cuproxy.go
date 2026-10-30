@@ -275,7 +275,7 @@ func cupsHandler(ctx *fasthttp.RequestCtx) {
 
 	// Construct a logger
 	path := bytes.Trim(ctx.Request.URI().Path(), "/")
-	requestedUrl := fmt.Sprintf("ipp://%s/%s", cupsListen, path)
+	requestedUrl := fmt.Sprintf("ipp://%s/%s", ctx.Host(), path)
 	log := zlog.With().
 		IPAddr("ip", ctx.RemoteIP()).
 		Str("url", requestedUrl).
